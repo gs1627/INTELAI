@@ -4,7 +4,7 @@ A touch-friendly 150-second laptop discovery game for the CMRIT × Intel Hackath
 
 ## Project analysis and architecture
 
-The supplied workspace was empty (no app, framework, assets, or concept report PDF). The project uses React, Vite, TypeScript, Framer Motion and Lucide icons in `frontend/`; FastAPI, Pydantic and SQLAlchemy in `backend/`; and an isolated localhost companion in `local-runner/`. See [architecture overview](docs/architecture/overview.md) and [benchmark status](docs/benchmark-protocol/status.md).
+The project uses React, Vite, TypeScript, Framer Motion and Lucide icons in `frontend/`; FastAPI, Pydantic and SQLite in `backend/`; and an isolated localhost companion in `local-runner/`. See [architecture overview](docs/architecture/overview.md), [benchmark status](docs/benchmark-protocol/status.md), and [deployment database decision](docs/deployment-database.md).
 
 ## Run the frontend
 
@@ -13,7 +13,7 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173. The complete game works without either Python service. Its blind pick, five personas, foreground checklist, proof receipt, reality reveal, same-brand recommendations and comparison view are interactive.
+Open http://localhost:5173. The API is optional for the sample experience; when available, the UI uses it for sessions, preferences, mission receipts, recommendations, and handoff. Sample profile and fixture data is explicitly identified in the interface.
 
 ## Run the API (optional)
 
@@ -21,10 +21,10 @@ Open http://localhost:5173. The complete game works without either Python servic
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r backend/requirements.txt
-uvicorn backend.app.main:app --reload --port 8000
+uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-The API defaults to a local SQLite `arena.db`. Configure `ARENA_DATABASE_URL`, `ARENA_CORS_ORIGINS`, and `ARENA_ADMIN_TOKEN` through environment variables for deployment. Never expose the local runner to the public internet.
+Run the API and frontend in separate terminals. Vite proxies `/api` to this server. The API uses local SQLite at `backend/arena.db` (override with `ARENA_DB_PATH`). SQLite under Vercel `/tmp` is ephemeral and unsuitable for durable shopper or associate state. See the [database deployment assessment](docs/deployment-database.md). To let the API call a local runner, set `LOCAL_RUNNER_URL=http://127.0.0.1:8765`; hardware claims remain unverified unless the runner supplies explicit verification evidence.
 
 ## Run the local runner (optional)
 
@@ -37,11 +37,12 @@ OpenVINO is optional. The runner reports available device identifiers when insta
 
 ## Evidence and limitations
 
-All bundled laptop and comparison fixtures are labelled `SAMPLE DATA`; fixture values are invented UI examples, not measurements. No historical verified benchmark database is bundled, so the interface reports missing comparable live data. The prototype does not implement admin catalogue editing, inventory integration, a compatible AI model, cloud hosting, a verified NPU execution path, or a production kiosk reset policy. The demo timer runs for up to 150 seconds but stage navigation remains customer-controlled and can move directly to later stages.
+Bundled comparison fixtures are labelled `SAMPLE DATA`; they are not measurements. Retail catalogue prices are source snapshots, not live quotes or inventory. No historical verified benchmark database is bundled, so the interface reports missing comparable live data. The demo timer uses one session start-time anchor and persists customer state in browser storage; backend state is local SQLite unless a durable production database is configured.
 
 ## Development checks
 
 ```powershell
-npm run build
-python -m pytest backend/tests
+npm.cmd run build
+python -m pytest backend/tests -q
+node --test frontend/tests/session-persistence.test.mjs
 ```

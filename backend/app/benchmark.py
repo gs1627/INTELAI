@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from statistics import median
 
 def compatible(current: dict, historical: dict) -> bool:

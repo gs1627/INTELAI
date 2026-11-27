@@ -1,233 +1,551 @@
-import os
+from __future__ import annotations
+
 import hashlib
-import secrets
-from datetime import timedelta
-from datetime import datetime, timezone
+import io
 import json
-from pathlib import Path
+import os
+import secrets
+import sqlite3
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 from uuid import uuid4
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, func, update
-from sqlalchemy.orm import Session
-from . import models
-from .db import Base, engine, get_db
-from .schemas import BenchmarkIn, BenchmarkOut, EventIn, SessionIn
 
-Base.metadata.create_all(bind=engine)
-app = FastAPI(title="Intel AI PC Arena API", version="1.0.0")
-origins = [x.strip() for x in os.getenv("ARENA_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=False, allow_methods=["GET","POST","PATCH","DELETE","OPTIONS"], allow_headers=["Content-Type","Authorization","X-Admin-Token"])
+from .db import DB_MODE, connect, get_db, init_db, now_iso
+from .schemas import (
+    AssociateLogin, BlindPick, ChecklistUpdate, CompareRequest, CompleteInteraction,
+    ForegroundChallenge, HandoffRequest, MissionRequest, RecommendationRequest, SessionCreate, ShopperDay,
+)
 
-def _now(): return datetime.now(timezone.utc)
-def _hash(value: str): return hashlib.sha256(value.encode()).hexdigest()
-def _event(db, sid, kind, details=None):
-    db.add(models.SessionHistory(id=str(uuid4()), session_id=sid, event_type=kind, details=details or {}))
+init_db()
+app = FastAPI(title="Intel AI PC Arena API", version="2.0.0")
+cors_origins = [x.strip() for x in os.getenv("ARENA_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_methods=["GET", "POST", "PATCH", "OPTIONS"], allow_headers=["Content-Type", "Authorization"])
 
-def _session(db, sid):
-    row = db.get(models.GameSession, sid)
-    if not row or (row.expires_at and row.expires_at < _now()): raise HTTPException(404, "Session not found or expired")
-    return row
+PERSONA_TRADEOFFS = {
+    "Student": ["Confirm the exact campus software and exam-proctoring tools run on the target OS/CPU architecture.", "The catalogue records manufacturer-listed battery capacity, not measured classroom runtime."],
+    "Creator": ["Check the exact editing app, plug-ins, codec support, and GPU acceleration on the selected configuration.", "16 GB RAM can constrain large projects; some listed memory is not user-upgradeable."],
+    "First Job": ["Verify employer VPN, endpoint security, and device-management compatibility before purchase.", "Pre-installed office offers and subscription terms vary by SKU and redemption date."],
+    "Gamer": ["Check each game's GPU requirements, anti-cheat driver support, and thermals; this catalogue has no gaming benchmark results.", "Integrated graphics are not a substitute for a discrete gaming GPU."],
+    "Everyday": ["Check the ports, webcam, keyboard layout, and screen in person if these affect daily use.", "Retail prices and local delivery availability can change by seller and pincode."],
+}
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _read_json(value: Optional[str], fallback: Any = None) -> Any:
+    if not value:
+        return fallback if fallback is not None else {}
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return fallback if fallback is not None else {}
+
+
+def _session(db: sqlite3.Connection, session_id: str) -> dict[str, Any]:
+    row = db.execute("SELECT * FROM shopper_sessions WHERE session_id = ?", (session_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Shopper session not found")
+    return {"session_id": row["session_id"], "handoff_code": row["handoff_code"], **_read_json(row["state_json"]), "created_at": row["created_at"], "updated_at": row["updated_at"], "finalized": bool(row["finalized"])}
+
+
+def _store_state(db: sqlite3.Connection, state: dict[str, Any]) -> None:
+    db.execute("UPDATE shopper_sessions SET state_json = ?, updated_at = ? WHERE session_id = ?", (_json({k: v for k, v in state.items() if k not in {"session_id", "handoff_code", "created_at", "updated_at", "finalized"}}), now_iso(), state["session_id"]))
+
+
+def _sku(db: sqlite3.Connection, sku_id: str) -> dict[str, Any]:
+    row = db.execute("SELECT data_json FROM laptops WHERE sku_id = ?", (sku_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Laptop SKU not found")
+    return _read_json(row["data_json"])
+
+
+def _catalog(db: sqlite3.Connection) -> list[dict[str, Any]]:
+    return [_read_json(r["data_json"]) for r in db.execute("SELECT data_json FROM laptops ORDER BY price_inr ASC, sku_id ASC").fetchall()]
+
+
+def _recent_mission(db: sqlite3.Connection, session_id: str) -> Optional[dict[str, Any]]:
+    row = db.execute("SELECT result_json FROM mission_runs WHERE session_id = ? ORDER BY created_at DESC LIMIT 1", (session_id,)).fetchone()
+    return _read_json(row["result_json"]) if row else None
+
+
+def _make_handoff_code(db: sqlite3.Connection) -> str:
+    for _ in range(20):
+        code = f"ARENA-{secrets.randbelow(9000) + 1000}"
+        if not db.execute("SELECT 1 FROM shopper_sessions WHERE handoff_code = ?", (code,)).fetchone():
+            return code
+    raise HTTPException(503, "Could not allocate a handoff code; try again")
+
+
+def _associate(authorization: Optional[str], db: sqlite3.Connection) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Associate login required")
+    token = authorization.split(" ", 1)[1].strip()
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    row = db.execute("SELECT store_id, expires_at FROM associate_tokens WHERE token_hash = ?", (digest,)).fetchone()
+    if not row or row["expires_at"] <= now_iso():
+        raise HTTPException(401, "Associate demo session expired")
+    return row["store_id"]
+
 
 @app.get("/health")
-def health(): return {"ok": True, "service": "arena-api", "version": "0.1.0"}
+@app.get("/api/health")
+def health(db: sqlite3.Connection = Depends(get_db)):
+    db_ok = False
+    sku_count = 0
+    try:
+        sku_count = db.execute("SELECT COUNT(*) FROM laptops").fetchone()[0]
+        db_ok = True
+    except Exception:
+        pass
+    return {
+        "ok": db_ok,
+        "service": "intel-ai-pc-arena",
+        "database_mode": DB_MODE,
+        "sku_count": sku_count,
+        "timestamp": now_iso(),
+        "npu_verified": False,
+        "available": True,
+        "status": "ok",
+    }
 
-@app.get("/ready")
-def ready(db: Session = Depends(get_db)):
-    try: db.execute(select(1)); return {"ok": True, "database": "ready"}
-    except Exception: raise HTTPException(503, "Database unavailable")
+
+@app.get("/api/system/status")
+def system_status(db: sqlite3.Connection = Depends(get_db)):
+    sku_count = db.execute("SELECT COUNT(*) FROM laptops").fetchone()[0]
+    return {
+        "backend": "ok",
+        "database": "ok",
+        "hardware_capability": "UNVERIFIED",
+        "execution_modes": ["SAMPLE DEMO", "HISTORICAL DATA"],
+        "live_hardware_available": False,
+        "demo_mode": True,
+        "npu_verified": False,
+        "catalogue_laptops": sku_count,
+        "disclaimer": "SAMPLE DEMONSTRATION DATA — not Intel-certified or a hardware benchmark.",
+        "timestamp": now_iso(),
+    }
+
+
+OPERATIVES = [
+    {"id": "nova", "name": "NOVA", "role": "The student", "icon": "✦", "color": "#6ad7ff", "quote": "Curiosity is my superpower.", "mission": "Turn a messy lecture note into a clean study guide.", "priority": "Battery life", "detail": "Classes, research & local AI study help"},
+    {"id": "pixel", "name": "PIXEL", "role": "The creator", "icon": "◈", "color": "#ff8ec3", "quote": "Make the idea impossible to ignore.", "mission": "Organise a creative brief and prep a visual pitch.", "priority": "GPU performance", "detail": "Editing, rendering & AI-assisted creation"},
+    {"id": "cipher", "name": "CIPHER", "role": "The professional", "icon": "⌘", "color": "#a89dff", "quote": "Make room for the work that matters.", "mission": "Triage a busy inbox and prep a meeting brief.", "priority": "Multitasking", "detail": "Meetings, documents & productive AI"},
+    {"id": "volt", "name": "VOLT", "role": "The gamer", "icon": "⚡", "color": "#ffc76b", "quote": "Every frame is another chance.", "mission": "Plan a tournament loadout under pressure.", "priority": "Graphics performance", "detail": "High refresh play, thermals & fast storage"},
+    {"id": "orbit", "name": "ORBIT", "role": "The everyday user", "icon": "◎", "color": "#7ee3bd", "quote": "The little things add up to a good day.", "mission": "Plan a weekend and clear a small to-do list.", "priority": "Portability", "detail": "Everyday speed, battery & easy carry"},
+]
+
+
+@app.get("/api/operatives")
+def list_operatives():
+    return {"operatives": OPERATIVES}
+
+
+@app.get("/api/laptops")
+def laptops(db: sqlite3.Connection = Depends(get_db)):
+    return {"items": _catalog(db), "count": db.execute("SELECT COUNT(*) FROM laptops").fetchone()[0], "currency": "INR", "generated_at": now_iso(), "price_notice": "Seed prices are source snapshots, not live quotes or inventory. Confirm price and stock with seller."}
+
 
 @app.post("/sessions", status_code=201)
-def create_session(payload: SessionIn, db: Session = Depends(get_db)):
-    data = payload.model_dump(exclude={"session_id"})
+@app.post("/api/sessions", status_code=201)
+def create_session(payload: SessionCreate, db: sqlite3.Connection = Depends(get_db)):
     sid = payload.session_id or str(uuid4())
-    row = db.get(models.GameSession, sid)
-    if row:
-        if row.expires_at and row.expires_at < _now(): raise HTTPException(410, "Session expired")
-        for key, value in data.items():
-            if value is not None and value != "": setattr(row, key, value)
-    else:
-        row = models.GameSession(session_id=sid, **data, expires_at=_now()+timedelta(hours=24))
-        db.add(row)
-    _event(db, sid, "SESSION_CREATED" if not row.start_time else "SESSION_UPDATED", {"persona": data.get("persona", "")})
-    db.commit()
-    return {"session_id": row.session_id, "created": True, "expires_at": row.expires_at}
-
-@app.get("/sessions/{session_id}")
-def get_session(session_id: str, db: Session = Depends(get_db)):
-    row = _session(db, session_id)
-    return {k: getattr(row, k) for k in ("session_id","current_laptop_id","persona","budget","priority","priorities","workloads","preferred_features","portability","start_time","expires_at")}
-
-@app.patch("/sessions/{session_id}")
-def update_session(session_id: str, payload: SessionIn, db: Session = Depends(get_db)):
-    row = _session(db, session_id)
-    for key, value in payload.model_dump(exclude={"session_id"}, exclude_unset=True).items(): setattr(row, key, value)
-    _event(db, session_id, "SESSION_UPDATED", payload.model_dump(exclude_none=True)); db.commit(); return {"session_id": session_id, "updated": True}
-
-@app.get("/sessions/{session_id}/history")
-def session_history(session_id: str, limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
-    _session(db, session_id)
-    rows = db.scalars(select(models.SessionHistory).where(models.SessionHistory.session_id==session_id).order_by(models.SessionHistory.created_at.desc()).offset(offset).limit(limit)).all()
-    return {"items": [{"event_type":r.event_type,"details":r.details,"created_at":r.created_at} for r in rows], "limit":limit,"offset":offset}
-
-@app.post("/sessions/{session_id}/handoff", status_code=201)
-def create_handoff(session_id: str, db: Session = Depends(get_db)):
-    _session(db, session_id); token=secrets.token_urlsafe(32); expiry=_now()+timedelta(minutes=10)
-    db.add(models.HandoffToken(token_hash=_hash(token),session_id=session_id,expires_at=expiry)); _event(db,session_id,"HANDOFF_CREATED"); db.commit()
-    base=os.getenv("ARENA_PUBLIC_URL","http://localhost:5173").rstrip("/")
-    return {"url":f"{base}/associate/handoff?token={token}","expires_at":expiry}
-
-@app.post("/handoffs/redeem")
-def redeem_handoff(token: str, db: Session = Depends(get_db)):
-    row=db.get(models.HandoffToken,_hash(token))
-    if not row or row.redeemed_at or row.expires_at < _now(): raise HTTPException(410,"Handoff token invalid, expired, or already used")
-    row.redeemed_at=_now(); _event(db,row.session_id,"HANDOFF_REDEEMED"); db.commit()
-    s=_session(db,row.session_id)
-    return {"session_id":s.session_id,"persona":s.persona,"budget":s.budget,"priority":s.priority,"workloads":s.workloads}
-
-@app.get("/products")
-def products(limit:int=Query(50,ge=1,le=200),offset:int=Query(0,ge=0), include_samples:bool=True, db:Session=Depends(get_db)):
-    q=select(models.Product)
-    if not include_samples: q=q.where(models.Product.is_sample.is_(False))
-    rows=db.scalars(q.offset(offset).limit(limit)).all()
-    return {"items":[{c:getattr(x,c) for c in ("product_id","brand","model","processor","ram_gb","storage_gb","display","battery","price","currency","ai_pc","source","verification_status","is_sample")} for x in rows],"limit":limit,"offset":offset,"total":db.scalar(select(func.count()).select_from(models.Product))}
-
-@app.post("/products",status_code=201)
-def add_product(payload:dict, x_admin_token:str|None=Header(default=None), db:Session=Depends(get_db)):
-    require_admin(x_admin_token)
-    required={"product_id","brand","model","processor","source","verification_status"}
-    if not required.issubset(payload): raise HTTPException(422,"Missing required product fields")
-    row=models.Product(**payload,is_sample=False); db.add(row); db.commit(); return {"product_id":row.product_id}
-
-@app.post("/sessions/{session_id}/recommendations")
-def recommend(session_id:str, db:Session=Depends(get_db)):
-    s=_session(db,session_id); rows=db.scalars(select(models.Product).where(models.Product.price.is_not(None),models.Product.is_sample.is_(True))).all()
-    affordable=[p for p in rows if p.price<= (s.budget or 200000)]
-    if not affordable: return {"recommendations":[]}
-    best=min(affordable,key=lambda p:abs((s.budget or p.price)-p.price)); value=min(affordable,key=lambda p:p.price)
-    ai=[p for p in affordable if p.ai_pc]; ai_pick=min(ai,key=lambda p:abs((s.budget or p.price)-p.price)) if ai else None
-    recs=[]
-    for label,p in (("Best Match",best),("Best Value",value),("AI-Ready Option",ai_pick)):
-        if p: recs.append({"category":label,"product_id":p.product_id,"brand":p.brand,"model":p.model,"price":p.price,"reasons":[f"Within stated budget of ₹{s.budget or 200000:,}"],"limitations":["Demonstration catalogue; confirm current specifications and price with seller."],"trade_offs":"Recommendation reflects listed fields only; no comparative benchmark claim."})
-    db.add(models.RecommendationResult(session_id=session_id,recommended_laptop_ids=[x["product_id"] for x in recs],reason_codes=[x["category"] for x in recs])); db.commit()
-    return {"recommendations":recs}
-
-@app.get("/inventory")
-def inventory(db:Session=Depends(get_db)):
-    rows=db.execute(select(models.Inventory,models.Product).join(models.Product)).all()
-    return {"label":"DEMO INVENTORY — NOT RETAIL STOCK","items":[{"inventory_id":i.inventory_id,"product_id":i.product_id,"brand":p.brand,"model":p.model,"location":i.location,"available":i.quantity} for i,p in rows]}
-
-@app.post("/reservations",status_code=201)
-def reserve(session_id:str, inventory_id:str, quantity:int=Query(1,ge=1,le=5), db:Session=Depends(get_db)):
-    _session(db,session_id)
+    # Upsert-friendly: return existing session if already created with same ID
+    existing = db.execute("SELECT * FROM shopper_sessions WHERE session_id = ?", (sid,)).fetchone()
+    if existing:
+        return _session(db, sid)
+    # Build initial state enriched with any fields sent by App.tsx
+    state: dict[str, Any] = {
+        "blind_pick_sku_id": payload.current_laptop_id if hasattr(payload, "current_laptop_id") else None,
+        "visual_reason": "",
+        "persona": getattr(payload, "persona", None) or None,
+        "budget_ceiling": getattr(payload, "budget", None) or 140_000,
+        "non_negotiable": "",
+        "top_priority": getattr(payload, "priority", "") or "",
+        "required_apps": [],
+        "last_mission": None,
+        "handoff": None,
+        "stage": "pick",
+        "mode": "SAMPLE DEMO",
+        "checklist": [False, False, False],
+        "rounds": [],
+    }
+    code = _make_handoff_code(db)
+    ts = now_iso()
     try:
-        with db.begin_nested():
-            result=db.execute(update(models.Inventory).where(models.Inventory.inventory_id==inventory_id,models.Inventory.quantity>=quantity).values(quantity=models.Inventory.quantity-quantity))
-            if not result.rowcount: raise HTTPException(409,"Insufficient demo inventory")
-            row=models.Reservation(reservation_id=str(uuid4()),session_id=session_id,inventory_id=inventory_id,quantity=quantity,expires_at=_now()+timedelta(minutes=30)); db.add(row)
-        db.commit(); return {"reservation_id":row.reservation_id,"status":row.status,"expires_at":row.expires_at,"inventory_label":"DEMO INVENTORY"}
-    except HTTPException: db.rollback(); raise
+        with db:
+            db.execute("INSERT INTO shopper_sessions (session_id, handoff_code, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", (sid, code, _json(state), ts, ts))
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "Session could not be created") from exc
+    return {"session_id": sid, "handoff_code": code, **state, "created_at": ts, "updated_at": ts}
 
-@app.post("/reservations/{reservation_id}/cancel")
-def cancel_reservation(reservation_id:str,db:Session=Depends(get_db)):
-    r=db.get(models.Reservation,reservation_id)
-    if not r: raise HTTPException(404,"Reservation not found")
-    if r.status!="CONFIRMED": raise HTTPException(409,"Reservation is not active")
-    inv=db.get(models.Inventory,r.inventory_id); inv.quantity+=r.quantity; r.status="CANCELLED"; db.commit(); return {"reservation_id":r.reservation_id,"status":r.status}
 
-@app.post("/demos",status_code=201)
-def record_demo(payload:dict,db:Session=Depends(get_db)):
-    s=_session(db,payload.get("session_id","")); workload=payload.get("workload")
-    if workload not in {"Study Sprint","Meeting Makeover","Creator Quick-Fix"}: raise HTTPException(422,"Unknown workload")
-    mode=payload.get("execution_mode")
-    if mode not in {"LOCAL","CLOUD","ILLUSTRATIVE_SIMULATION"}: raise HTTPException(422,"Invalid execution mode")
-    row=models.DemoResult(demo_id=str(uuid4()),session_id=s.session_id,workload=workload,input_reference=payload.get("input_reference",""),output=payload.get("output",{}),execution_mode=mode); db.add(row); _event(db,s.session_id,"DEMO_COMPLETED",{"workload":workload,"execution_mode":mode}); db.commit()
-    return {"demo_id":row.demo_id,"workload":workload,"execution_mode":mode,"created_at":row.created_at}
+@app.get("/api/sessions/{session_id}")
+def get_shopper_session(session_id: str, db: sqlite3.Connection = Depends(get_db)):
+    return _session(db, session_id)
 
-@app.post("/events", status_code=201)
-def collect_event(payload: EventIn, db: Session = Depends(get_db)):
-    if not db.get(models.GameSession, payload.session_id): raise HTTPException(404, "Unknown anonymous session")
-    if db.get(models.RoundEvent, payload.event_id): raise HTTPException(409, "Duplicate event")
-    row = models.RoundEvent(event_id=payload.event_id, **payload.model_dump(exclude={"event_id"}))
-    db.add(row); _event(db,payload.session_id,"ROUND_EVENT",{"round_id":payload.round_id,"outcome":payload.outcome}); db.commit(); return {"event_id": row.event_id, "stored": True, "benchmark_eligible": False}
 
-@app.get("/benchmarks", response_model=list[BenchmarkOut])
-def benchmarks(brand: str = Query(min_length=2, max_length=30), tier: int | None = Query(default=None, ge=5, le=9), series: int | None = Query(default=None, ge=2, le=3), db: Session = Depends(get_db)):
-    stmt = select(models.BenchmarkResult, models.BenchmarkSession, models.Laptop, models.Processor, models.BenchmarkTest).join(models.BenchmarkSession).join(models.Laptop).join(models.Processor).join(models.BenchmarkTest).where(models.Laptop.brand == brand, models.BenchmarkResult.verification_status == "VERIFIED", models.BenchmarkResult.is_sample.is_(False))
-    if tier: stmt = stmt.where(models.Processor.tier == tier)
-    if series: stmt = stmt.where(models.Processor.series == series)
-    rows = db.execute(stmt).all()
-    return [BenchmarkOut(result_id=r.result_id,laptop_id=l.laptop_id,brand=l.brand,model_name=l.model_name,processor_sku=p.exact_sku,tier=p.tier,series=p.series,round_id=t.round_id,completion_time=r.completion_time,fps=r.fps,task_success=r.task_success,verification_status=r.verification_status,sample_count=r.sample_count,test_date=s.test_date,is_sample=r.is_sample) for r,s,l,p,t in rows]
+@app.patch("/api/sessions/{session_id}/blind-pick")
+def update_blind_pick(session_id: str, payload: BlindPick, db: sqlite3.Connection = Depends(get_db)):
+    state = _session(db, session_id)
+    _sku(db, payload.sku_id)
+    state["blind_pick_sku_id"] = payload.sku_id
+    state["visual_reason"] = payload.visual_reason
+    with db:
+        _store_state(db, state)
+    return {"session_id": session_id, "blind_pick_sku_id": payload.sku_id, "visual_reason": payload.visual_reason, "updated_at": now_iso()}
 
-@app.get("/sample/benchmarks")
-def sample_benchmarks(brand: str = Query(min_length=2, max_length=30)):
-    """Read-only illustrative fixture. It is always explicitly labelled sample data."""
-    fixture = Path(__file__).resolve().parents[2] / "data" / "benchmark-fixtures" / "sample-rounds.json"
-    if not fixture.exists():
-        # Source checkout has the shared fixture at the project root, two levels above backend.
-        fixture = Path(__file__).resolve().parents[3] / "data" / "benchmark-fixtures" / "sample-rounds.json"
-    if not fixture.exists(): raise HTTPException(503, "Sample fixture unavailable")
-    payload = json.loads(fixture.read_text(encoding="utf-8"))
-    return {"evidence": "SAMPLE DATA", "disclaimer": payload.get("disclaimer", "Illustrative only"), "records": [r for r in payload.get("records", []) if r.get("brand") == brand]}
 
-def require_admin(x_admin_token: str | None):
-    expected = os.getenv("ARENA_ADMIN_TOKEN")
-    if not expected or x_admin_token != expected: raise HTTPException(403, "Administrative access is not configured or token is invalid")
+@app.patch("/api/sessions/{session_id}/day")
+def update_day(session_id: str, payload: ShopperDay, db: sqlite3.Connection = Depends(get_db)):
+    state = _session(db, session_id)
+    state.update(payload.model_dump())
+    with db:
+        _store_state(db, state)
+    return {"session_id": session_id, "persona": payload.persona, "budget_ceiling": payload.budget_ceiling, "top_priority": payload.top_priority, "required_apps": payload.required_apps, "updated_at": now_iso()}
 
-@app.post("/admin/benchmarks/{result_id}/review")
-def review_benchmark(result_id: str, decision: str, x_admin_token: str | None = Header(default=None), db: Session = Depends(get_db)):
-    require_admin(x_admin_token)
-    if decision not in {"APPROVE", "REJECT"}: raise HTTPException(422, "Decision must be APPROVE or REJECT")
-    row = db.get(models.BenchmarkResult, result_id)
-    if not row: raise HTTPException(404, "Benchmark result not found")
-    # Review is not enough by itself: NPU claims require explicit runner evidence attached to metadata.
-    evidence = row.benchmark_metadata or {}
-    if decision == "APPROVE" and (row.is_sample or row.sample_count < 3 or (row.execution_provider == "NPU" and evidence.get("runtime_verified") is not True)):
-        raise HTTPException(422, "Record lacks required validation evidence")
-    row.verification_status = "VERIFIED" if decision == "APPROVE" else "REJECTED"
-    db.commit(); return {"result_id": result_id, "verification_status": row.verification_status}
 
-@app.post("/associates/register", status_code=201)
-def register_associate(payload:dict, db:Session=Depends(get_db)):
-    if os.getenv("ARENA_ALLOW_ASSOCIATE_REGISTRATION","false").lower()!="true": raise HTTPException(403,"Associate registration is disabled")
-    username=str(payload.get("username","")); password=str(payload.get("password",""))
-    if len(username)<3 or len(password)<12: raise HTTPException(422,"Username must be 3+ characters and password 12+ characters")
-    if db.scalar(select(models.Associate).where(models.Associate.username==username)): raise HTTPException(409,"Username already exists")
-    salt=secrets.token_hex(16); pw=hashlib.pbkdf2_hmac("sha256",password.encode(),salt.encode(),310000).hex()
-    row=models.Associate(associate_id=str(uuid4()),username=username,password_hash=salt+":"+pw); db.add(row); db.commit(); return {"associate_id":row.associate_id,"username":username}
+def _runner_result(session_id: str, mission_id: str, airplane_mode: bool) -> Optional[dict[str, Any]]:
+    runner_url = os.getenv("LOCAL_RUNNER_URL", "").strip()
+    if not runner_url:
+        return None
+    request = urllib.request.Request(runner_url.rstrip("/") + "/relay", data=_json({"session_id": session_id, "mission_id": mission_id, "airplane_mode": airplane_mode}).encode(), headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=2.5) as response:
+            if response.status != 200:
+                return None
+            result = json.loads(response.read(1_000_000).decode("utf-8"))
+            return result if isinstance(result, dict) else None
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
 
-@app.post("/associates/login")
-def associate_login(payload:dict, db:Session=Depends(get_db)):
-    row=db.scalar(select(models.Associate).where(models.Associate.username==str(payload.get("username",""))))
-    if not row: raise HTTPException(401,"Invalid credentials")
-    salt,stored=row.password_hash.split(":",1); candidate=hashlib.pbkdf2_hmac("sha256",str(payload.get("password"," ")).encode(),salt.encode(),310000).hex()
-    if not secrets.compare_digest(stored,candidate): raise HTTPException(401,"Invalid credentials")
-    token=secrets.token_urlsafe(36); row.token_hash=_hash(token); row.token_expires_at=_now()+timedelta(hours=8); db.commit(); return {"access_token":token,"token_type":"bearer","expires_at":row.token_expires_at}
 
-def current_associate(authorization:str|None,db:Session):
-    if not authorization or not authorization.startswith("Bearer "): raise HTTPException(401,"Associate authentication required")
-    row=db.scalar(select(models.Associate).where(models.Associate.token_hash==_hash(authorization[7:])))
-    if not row or not row.token_expires_at or row.token_expires_at<_now(): raise HTTPException(401,"Associate session expired")
-    return row
+def _simulation_result(session_id: str, mission_id: str, airplane_mode: bool) -> dict[str, Any]:
+    seed = hashlib.sha256(f"{session_id}:{mission_id}".encode()).digest()
+    local_ms = 420 + int.from_bytes(seed[:2], "big") % 1580
+    cloud_ms = 180 + int.from_bytes(seed[2:4], "big") % 820
+    online = not airplane_mode
+    return {
+        "mission_id": mission_id,
+        "execution_mode": "ILLUSTRATIVE_SIMULATION",
+        "badge": "DEMO / RECORDED PROOF",
+        "verified_hardware": False,
+        "simulated": True,
+        "network_state": "ONLINE (SIMULATED)" if online else "AIRPLANE MODE / OFFLINE",
+        "execution_location": "SIMULATION; no local or cloud inference ran",
+        "compute_engine": "NOT MEASURED",
+        "cloud": {"available": online, "illustrative_time_ms": cloud_ms if online else None, "label": "SIMULATED ESTIMATE" if online else "UNAVAILABLE OFFLINE"},
+        "local": {"available": True, "illustrative_time_ms": local_ms, "label": "SIMULATED ESTIMATE"},
+        "outcome": "Illustrative flow only; no workload was executed.",
+        "timing_notice": "Illustrative deterministic UI timings, not measured performance.",
+    }
 
-@app.get("/associates/me")
-def associate_me(authorization:str|None=Header(default=None),db:Session=Depends(get_db)):
-    a=current_associate(authorization,db); return {"associate_id":a.associate_id,"username":a.username}
 
-@app.post("/associates/interactions",status_code=201)
-def associate_interaction(payload:dict,authorization:str|None=Header(default=None),db:Session=Depends(get_db)):
-    a=current_associate(authorization,db); _session(db,payload.get("session_id",""))
-    outcome=payload.get("outcome","Follow-up Required")
-    if outcome not in {"Purchased Today","Quotation Taken","Follow-up Required"}: raise HTTPException(422,"Invalid interaction outcome")
-    row=models.Interaction(interaction_id=str(uuid4()),associate_id=a.associate_id,session_id=payload["session_id"],product_id=payload.get("product_id"),reservation_id=payload.get("reservation_id"),checklist=payload.get("checklist",{}),outcome=outcome)
-    db.add(row); _event(db,row.session_id,"ASSOCIATE_INTERACTION",{"outcome":outcome}); db.commit(); return {"interaction_id":row.interaction_id,"outcome":outcome}
+@app.post("/api/sessions/{session_id}/run-mission", status_code=201)
+def run_mission(session_id: str, payload: MissionRequest, db: sqlite3.Connection = Depends(get_db)):
+    _session(db, session_id)
+    runner = _runner_result(session_id, payload.mission_id, payload.airplane_mode)
+    if runner is None:
+        result = _simulation_result(session_id, payload.mission_id, payload.airplane_mode)
+    else:
+        verified = runner.get("verified_hardware") is True and runner.get("execution_mode") == "LOCAL"
+        engine = str(runner.get("compute_engine", "NOT VERIFIED")).upper()
+        badge = "DEMO / RECORDED PROOF"
+        if verified and engine == "NPU":
+            badge = "NPU-ACCELERATED"
+        elif verified and engine in {"CPU", "GPU", "CPU/GPU"}:
+            badge = "CPU/GPU LOCAL"
+        elif verified:
+            badge = "LOCAL"
+        result = {
+            "mission_id": payload.mission_id, "execution_mode": "LOCAL" if verified else "DEMO / RECORDED PROOF",
+            "badge": badge, "verified_hardware": verified, "simulated": not verified,
+            "network_state": "AIRPLANE MODE / OFFLINE" if payload.airplane_mode else ("ONLINE" if runner.get("network_used") else "NETWORK NOT USED / UNKNOWN"),
+            "execution_location": "LOCAL DEVICE" if verified else "UNVERIFIED RUNNER RESPONSE",
+            "compute_engine": engine if verified else "NOT VERIFIED", "cloud": {"available": False, "label": "NOT RUN"},
+            "local": {"available": True, "duration_ms": runner.get("duration_ms") if verified else None, "label": "VERIFIED LOCAL RESULT" if verified else "RESULT NOT VERIFIED"},
+            "outcome": runner.get("result") if verified else "Runner responded, but did not provide required verification evidence.",
+            "timing_notice": "Hardware results are accepted only when the runner explicitly attests verified local execution.",
+        }
+    run_id, ts = str(uuid4()), now_iso()
+    with db:
+        db.execute("INSERT INTO mission_runs (run_id, session_id, mission_id, result_json, created_at) VALUES (?, ?, ?, ?, ?)", (run_id, session_id, payload.mission_id, _json(result), ts))
+        state = _session(db, session_id)
+        state["last_mission"] = {"run_id": run_id, "created_at": ts, **result}
+        _store_state(db, state)
+    return {"run_id": run_id, "created_at": ts, **result}
 
-@app.get("/reports/summary")
-def reports_summary(db:Session=Depends(get_db)):
-    return {"sessions":db.scalar(select(func.count()).select_from(models.GameSession)) or 0,"completed_demos":db.scalar(select(func.count()).select_from(models.DemoResult)) or 0,"reservations":db.scalar(select(func.count()).select_from(models.Reservation)) or 0,"associate_interactions":db.scalar(select(func.count()).select_from(models.Interaction)) or 0,"outcomes":{x:db.scalar(select(func.count()).select_from(models.Interaction).where(models.Interaction.outcome==x)) or 0 for x in ("Purchased Today","Quotation Taken","Follow-up Required")}}
 
-@app.get("/reports/sessions")
-def report_sessions(limit:int=Query(50,ge=1,le=200),offset:int=Query(0,ge=0),db:Session=Depends(get_db)):
-    rows=db.scalars(select(models.GameSession).order_by(models.GameSession.start_time.desc()).offset(offset).limit(limit)).all()
-    return {"items":[{"session_id":x.session_id,"persona":x.persona,"budget":x.budget,"start_time":x.start_time,"workload_count":len(x.workloads or [])} for x in rows],"limit":limit,"offset":offset}
+@app.get("/api/sessions/{session_id}/proof-receipt")
+def proof_receipt(session_id: str, db: sqlite3.Connection = Depends(get_db)):
+    state = _session(db, session_id)
+    selected = _sku(db, state["blind_pick_sku_id"]) if state.get("blind_pick_sku_id") else None
+    mission = _recent_mission(db, session_id)
+    tradeoffs = PERSONA_TRADEOFFS.get(state.get("persona"), PERSONA_TRADEOFFS["Everyday"])
+    return {
+        "session_id": session_id,
+        "pillars": {
+            "network_state": (mission or {}).get("network_state", "NOT RUN"),
+            "execution_location": (mission or {}).get("execution_location", "NOT RUN"),
+            "compute_engine": (mission or {}).get("compute_engine", "NOT MEASURED"),
+            "outcome": (mission or {}).get("outcome", "No mission result yet."),
+        },
+        "badge": (mission or {}).get("badge", "DEMO / RECORDED PROOF"),
+        "blind_pick": selected,
+        "blind_pick_reason": state.get("visual_reason", ""),
+        "tradeoffs": tradeoffs,
+        "price_notice": "Catalogue prices are source snapshots; this receipt is not a quote or inventory reservation.",
+        "generated_at": now_iso(),
+    }
 
+
+def _required_apps_fit(sku: dict[str, Any], required_apps: list[str]) -> bool:
+    if not required_apps:
+        return True
+    # These explicit requirements mean an x64 kernel driver/runtime is mandatory.
+    x64_only = {"x64-only driver", "legacy x64 kernel driver", "x64-only anti-cheat"}
+    return not (sku["app_compatibility"]["architecture"] == "Arm64" and any(a.strip().lower() in x64_only for a in required_apps))
+
+
+def _ownership_breakdown(price: int) -> dict[str, Any]:
+    return {"basis": "cash price divided evenly; no interest, fees, or financing implied", "monthly": {str(months): round(price / months, 2) for months in (12, 24, 36)}}
+
+
+def _loadout_card(sku: dict[str, Any], state: dict[str, Any], selected: Optional[dict[str, Any]]) -> dict[str, Any]:
+    price, budget = sku["price_inr"], state["budget_ceiling"]
+    priority = (state.get("top_priority") or "").lower()
+    ai_wanted = any(x in priority for x in ("ai", "npu", "copilot"))
+    if "battery" in priority:
+        priority_met = sku["battery_wh"] >= 70
+        priority_reason = f"{sku['battery_wh']} Wh listed capacity; this is not a battery-life estimate."
+    elif "portab" in priority:
+        priority_met = sku["weight_kg"] <= 1.4
+        priority_reason = f"Listed weight: {sku['weight_kg']} kg."
+    elif "multi" in priority or "memory" in priority:
+        priority_met = sku["ram_gb"] >= 16
+        priority_reason = f"{sku['ram_gb']} GB listed memory."
+    elif "display" in priority or "screen" in priority:
+        priority_met = sku["display"]["panel"].lower().find("oled") >= 0 or sku["display"]["refresh_hz"] >= 120
+        priority_reason = f"{sku['display']['panel']}, {sku['display']['refresh_hz']} Hz listed panel."
+    elif "gpu" in priority or "graphic" in priority:
+        priority_met = any(x in sku["gpu"].lower() for x in ("nvidia", "geforce", "radeon 8060", "rtx"))
+        priority_reason = f"Listed graphics: {sku['gpu']}; no benchmark supplied."
+    else:
+        priority_met = sku["processor"]["npu_tops"] >= 40 if ai_wanted else True
+        priority_reason = f"{sku['processor']['npu_tops']} processor NPU TOPS listed; app support still varies."
+    app_fit = _required_apps_fit(sku, state.get("required_apps", []))
+    persona = state.get("persona") or "Everyday"
+    persona_fit = sku["ram_gb"] >= 16
+    if persona == "Gamer":
+        persona_fit = sku["display"]["refresh_hz"] >= 120 or any(x in sku["gpu"].lower() for x in ("rtx", "geforce"))
+    elif persona == "Creator":
+        persona_fit = sku["ram_gb"] >= 16 and sku["storage_gb"] >= 512
+    elif persona == "Student":
+        persona_fit = sku["weight_kg"] <= 1.9 and sku["storage_gb"] >= 512
+    within_budget = price <= budget
+    criteria = [within_budget, sku["ram_gb"] >= 16, app_fit, persona_fit, priority_met]
+    reasons = [f"{price:,} INR source snapshot is within the {budget:,} INR budget." if within_budget else "Over budget; excluded from eligible cards.", priority_reason, f"Architecture: {sku['app_compatibility']['architecture']}; required apps checked against the declared compatibility notes."]
+    delta = price - selected["price_inr"] if selected else None
+    return {
+        "sku": sku, "priorities_met": f"{sum(criteria)} of 5 priorities met", "score": sum(criteria),
+        "reasons": reasons, "compromise": sku["limitation"], "price_delta_inr": delta,
+        "monthly_ownership_cost": _ownership_breakdown(price),
+    }
+
+
+@app.get("/api/sessions/{session_id}/loadout")
+def loadout(session_id: str, priority: Optional[str] = Query(default=None, max_length=100), db: sqlite3.Connection = Depends(get_db)):
+    state = _session(db, session_id)
+    if priority is not None:
+        state["top_priority"] = priority
+    if state.get("budget_ceiling") is None:
+        raise HTTPException(409, "Complete the shopper day before requesting recommendations")
+    if not state.get("blind_pick_sku_id"):
+        raise HTTPException(409, "Select a blind-pick laptop before requesting recommendations")
+    selected = _sku(db, state["blind_pick_sku_id"])
+    candidates = [x for x in _catalog(db) if x["price_inr"] is not None and x["price_inr"] <= state["budget_ceiling"] and _required_apps_fit(x, state.get("required_apps", []))]
+    scored = [_loadout_card(x, state, selected) for x in candidates]
+    if not scored:
+        return {"priority": state.get("top_priority"), "best_match": None, "save_money": None, "stretch": None, "excluded": "No catalogue SKU passes the budget and app-compatibility gates.", "generated_at": now_iso()}
+    best = sorted(scored, key=lambda x: (-x["score"], abs(x["sku"]["price_inr"] - (state["budget_ceiling"] * 0.7)), x["sku"]["price_inr"], x["sku"]["brand"]))[0]
+    save = min(scored, key=lambda x: (x["sku"]["price_inr"], x["sku"]["brand"]))
+    stretch = max(scored, key=lambda x: (x["sku"]["price_inr"], x["sku"]["brand"]))
+    return {"priority": state.get("top_priority"), "budget_ceiling": state["budget_ceiling"], "best_match": best, "save_money": save, "stretch": stretch, "shortlisted_skus": len(scored), "rule_notice": "Hard gates are budget and explicit app-architecture conflicts. Scores use only listed configuration fields; no brand weighting or benchmark ranking.", "generated_at": now_iso()}
+
+
+@app.get("/api/sessions/{session_id}/reality-reveal")
+def reality_reveal(session_id: str, db: sqlite3.Connection = Depends(get_db)):
+    state = _session(db, session_id)
+    if not state.get("blind_pick_sku_id"):
+        raise HTTPException(409, "Choose a blind-pick laptop before revealing its configuration")
+    return {"session_id": session_id, "selected_configuration": _sku(db, state["blind_pick_sku_id"]), "revealed_at": now_iso(), "data_notice": "Manufacturer and catalogue fields; no performance result is implied."}
+
+
+@app.post("/api/sessions/{session_id}/foreground-challenge", status_code=201)
+def foreground_challenge(session_id: str, payload: ForegroundChallenge, db: sqlite3.Connection = Depends(get_db)):
+    state = _session(db, session_id)
+    result = {"challenge_id": payload.challenge_id, "completed_steps": payload.completed_steps, "elapsed_ms": payload.elapsed_ms, "execution": "BROWSER SESSION", "hardware_benchmark": False, "recorded_at": now_iso()}
+    state["foreground_challenge"] = result
+    with db:
+        _store_state(db, state)
+    return {"session_id": session_id, **result}
+
+
+@app.get("/api/sessions/{session_id}/foreground-challenge")
+def get_foreground_challenge(session_id: str, db: sqlite3.Connection = Depends(get_db)):
+    state = _session(db, session_id)
+    return {"session_id": session_id, "result": state.get("foreground_challenge"), "hardware_benchmark": False}
+
+
+@app.get("/api/sessions/{session_id}/foreground-test/results")
+def get_foreground_test_results(session_id: str, db: sqlite3.Connection = Depends(get_db)):
+    return get_foreground_challenge(session_id, db)
+
+
+@app.post("/api/sessions/{session_id}/recommendations")
+def create_recommendations(session_id: str, payload: RecommendationRequest, db: sqlite3.Connection = Depends(get_db)):
+    return loadout(session_id, payload.priority, db)
+
+
+@app.get("/api/sessions/{session_id}/recommendations")
+def get_recommendations(session_id: str, priority: Optional[str] = Query(default=None, max_length=100), db: sqlite3.Connection = Depends(get_db)):
+    return loadout(session_id, priority, db)
+
+
+@app.post("/api/sessions/{session_id}/complete")
+def complete_session(session_id: str, db: sqlite3.Connection = Depends(get_db)):
+    state = _session(db, session_id)
+    with db:
+        db.execute("UPDATE shopper_sessions SET finalized = 1, updated_at = ? WHERE session_id = ?", (now_iso(), session_id))
+        state["completed_at"] = now_iso()
+        _store_state(db, state)
+    return {"session_id": session_id, "completed": True, "completed_at": state["completed_at"]}
+
+
+@app.get("/api/sessions/{session_id}/handoff/qr")
+def handoff_qr(session_id: str, db: sqlite3.Connection = Depends(get_db)):
+    state = _session(db, session_id)
+    if not state.get("handoff"):
+        raise HTTPException(409, "Create a handoff before requesting its QR code")
+    import qrcode
+    from qrcode.image.svg import SvgPathImage
+
+    buffer = io.BytesIO()
+    qrcode.make(state["handoff"]["qr_payload"]["path"], image_factory=SvgPathImage, box_size=8, border=2).save(buffer)
+    return Response(content=buffer.getvalue(), media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/sessions/{session_id}/handoff")
+def finalize_handoff(session_id: str, payload: Optional[HandoffRequest] = None, db: sqlite3.Connection = Depends(get_db)):
+    state = _session(db, session_id)
+    code = state["handoff_code"]
+    qr_payload = {"code": code, "path": f"/associate?code={code}"}
+    with db:
+        db.execute("UPDATE shopper_sessions SET finalized = 1, updated_at = ? WHERE session_id = ?", (now_iso(), session_id))
+        state["handoff"] = {"handoff_code": code, "qr_payload": qr_payload, "created_at": now_iso()}
+        _store_state(db, state)
+    return {"session_id": session_id, "handoff_code": code, "qr_payload": qr_payload, "finalized": True, "privacy": "QR payload contains only an opaque session lookup code."}
+
+
+@app.post("/api/associate/login")
+def associate_login(payload: AssociateLogin, db: sqlite3.Connection = Depends(get_db)):
+    if payload.demo_login:
+        store_id = payload.store_id or "DEMO-STORE"
+    elif payload.store_id and payload.pin == "1234":
+        store_id = payload.store_id
+    else:
+        raise HTTPException(401, "Use Demo Login or enter a store ID and demo PIN 1234")
+    token = secrets.token_urlsafe(32)
+    expires = (datetime.now(timezone.utc) + timedelta(hours=8)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    with db:
+        db.execute("INSERT INTO associate_tokens(token_hash, store_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (digest, store_id, expires, now_iso()))
+    return {"access_token": token, "token_type": "bearer", "store_id": store_id, "expires_at": expires, "demo_auth": True}
+
+
+@app.post("/api/associate/sessions/{session_id}/claim")
+def claim_session(session_id: str, authorization: Optional[str] = Header(default=None), db: sqlite3.Connection = Depends(get_db)):
+    store_id = _associate(authorization, db)
+    state = _session(db, session_id)
+    if not state.get("handoff"):
+        raise HTTPException(409, "Shopper must generate a handoff before an associate can claim the session")
+    token = authorization.split(" ", 1)[1].strip()
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    existing = db.execute("SELECT store_id FROM associate_claims WHERE session_id = ?", (session_id,)).fetchone()
+    if existing:
+        if existing["store_id"] != store_id:
+            raise HTTPException(409, "Shopper session is already claimed by another store")
+        return {"session_id": session_id, "store_id": store_id, "claimed": True, "already_claimed": True}
+    with db:
+        db.execute("INSERT INTO associate_claims(session_id, store_id, token_hash, created_at) VALUES (?, ?, ?, ?)", (session_id, store_id, token_hash, now_iso()))
+    return {"session_id": session_id, "store_id": store_id, "claimed": True, "already_claimed": False}
+
+
+@app.get("/api/associate/dashboard")
+def associate_dashboard(authorization: Optional[str] = Header(default=None), db: sqlite3.Connection = Depends(get_db)):
+    store_id = _associate(authorization, db)
+    rows = db.execute("SELECT session_id, handoff_code, state_json, created_at, updated_at, finalized FROM shopper_sessions ORDER BY updated_at DESC LIMIT 30").fetchall()
+    sessions = [{"session_id": r["session_id"], "handoff_code": r["handoff_code"], "persona": _read_json(r["state_json"]).get("persona"), "blind_pick_sku_id": _read_json(r["state_json"]).get("blind_pick_sku_id"), "updated_at": r["updated_at"], "finalized": bool(r["finalized"])} for r in rows]
+    totals = db.execute("SELECT COUNT(*) AS sessions, SUM(finalized) AS handoffs FROM shopper_sessions").fetchone()
+    actions = {r["action"]: r["count"] for r in db.execute("SELECT action, COUNT(*) AS count FROM associate_interactions GROUP BY action").fetchall()}
+    return {"store_id": store_id, "sessions": sessions, "metrics": {"sessions": totals["sessions"] or 0, "handoffs": totals["handoffs"] or 0, "trials": actions.get("trial", 0), "quotes": actions.get("quote", 0), "purchases": actions.get("purchase", 0), "follow_ups": actions.get("follow_up", 0)}, "generated_at": now_iso()}
+
+
+@app.get("/api/associate/lookup/{code}")
+def associate_lookup(code: str, authorization: Optional[str] = Header(default=None), db: sqlite3.Connection = Depends(get_db)):
+    _associate(authorization, db)
+    row = db.execute("SELECT session_id FROM shopper_sessions WHERE handoff_code = ? OR session_id = ?", (code.upper(), code)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Shopper session not found; try the cached kiosk session or rescan its QR code")
+    state = _session(db, row["session_id"])
+    if not state.get("handoff"):
+        raise HTTPException(409, "Shopper has not generated a handoff for this session")
+    if state.get("blind_pick_sku_id"):
+        state["blind_pick"] = _sku(db, state["blind_pick_sku_id"])
+    state["proof_receipt"] = proof_receipt(state["session_id"], db)
+    state["loadout"] = loadout(state["session_id"], None, db) if state.get("budget_ceiling") and state.get("blind_pick_sku_id") else None
+    state["checklist"] = _read_json((db.execute("SELECT checklist_json FROM associate_checklists WHERE session_id = ?", (state["session_id"],)).fetchone() or {"checklist_json": "{}"})["checklist_json"])
+    return state
+
+
+@app.post("/api/associate/compare")
+def associate_compare(payload: CompareRequest, authorization: Optional[str] = Header(default=None), db: sqlite3.Connection = Depends(get_db)):
+    _associate(authorization, db)
+    if len(set(payload.sku_ids)) != len(payload.sku_ids):
+        raise HTTPException(422, "Choose distinct laptop SKUs")
+    return {"items": [_sku(db, sku_id) for sku_id in payload.sku_ids], "fairness_notice": "Exact SKU configurations are compared side by side. No performance score is inferred from brand or processor name.", "generated_at": now_iso()}
+
+
+@app.patch("/api/associate/sessions/{session_id}/checklist")
+def update_checklist(session_id: str, payload: ChecklistUpdate, authorization: Optional[str] = Header(default=None), db: sqlite3.Connection = Depends(get_db)):
+    _associate(authorization, db)
+    _session(db, session_id)
+    allowed = {"power_on", "wifi", "camera", "audio", "keyboard", "local_demo", "ports", "customer_questions"}
+    if not set(payload.states).issubset(allowed):
+        raise HTTPException(422, "Unknown physical demo checklist item")
+    old_row = db.execute("SELECT checklist_json FROM associate_checklists WHERE session_id = ?", (session_id,)).fetchone()
+    states = _read_json(old_row["checklist_json"]) if old_row else {}
+    states.update(payload.states)
+    with db:
+        db.execute("INSERT INTO associate_checklists(session_id, checklist_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET checklist_json=excluded.checklist_json, updated_at=excluded.updated_at", (session_id, _json(states), now_iso()))
+    return {"session_id": session_id, "states": states, "updated_at": now_iso()}
+
+
+@app.post("/api/associate/sessions/{session_id}/complete", status_code=201)
+def complete_interaction(session_id: str, payload: CompleteInteraction, authorization: Optional[str] = Header(default=None), db: sqlite3.Connection = Depends(get_db)):
+    store_id = _associate(authorization, db)
+    state = _session(db, session_id)
+    if payload.selected_sku_id:
+        _sku(db, payload.selected_sku_id)
+    interaction_id, ts = str(uuid4()), now_iso()
+    with db:
+        db.execute("INSERT INTO associate_interactions(interaction_id, session_id, store_id, action, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", (interaction_id, session_id, store_id, payload.action, _json({"note": payload.note, "selected_sku_id": payload.selected_sku_id}), ts))
+        state["retail_action"] = payload.action
+        _store_state(db, state)
+    return {"interaction_id": interaction_id, "session_id": session_id, "action": payload.action, "selected_sku_id": payload.selected_sku_id, "recorded_at": ts}

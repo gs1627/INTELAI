@@ -1,0 +1,5 @@
+_stitch_ref/
+.git/
+backend/arena.db
+__pycache__/
+*.pyc
