@@ -20,5 +20,16 @@ def difference(current: float | None, comparison: float | None, lower_is_better:
     return {"available": True, "difference": delta, "direction": "comparison better" if improves else "current better" if delta else "similar"}
 
 def valid_npu_evidence(record: dict) -> bool:
-    return record.get("execution_provider") == "NPU" and record.get("runtime_verified") is True and record.get("model_hash") and record.get("prompt_hash")
+    import re
+
+    hashes_valid = all(isinstance(record.get(key), str) and re.fullmatch(r"[a-fA-F0-9]{64}", record[key]) for key in ("model_hash", "input_hash", "prompt_hash"))
+    return (
+        record.get("execution_provider") == "NPU"
+        and record.get("runtime_verified") is True
+        and record.get("verification_status") == "VERIFIED"
+        and record.get("signature_verified") is True
+        and bool(record.get("device_name"))
+        and bool(record.get("runtime_version"))
+        and hashes_valid
+    )
 

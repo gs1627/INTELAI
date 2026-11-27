@@ -24,7 +24,7 @@ pip install -r backend/requirements.txt
 uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Run the API and frontend in separate terminals. Vite proxies `/api` to this server. The API uses local SQLite at `backend/arena.db` (override with `ARENA_DB_PATH`). SQLite under Vercel `/tmp` is ephemeral and unsuitable for durable shopper or associate state. See the [database deployment assessment](docs/deployment-database.md). To let the API call a local runner, set `LOCAL_RUNNER_URL=http://127.0.0.1:8765`; hardware claims remain unverified unless the runner supplies explicit verification evidence.
+Run the API and frontend in separate terminals. Vite proxies `/api` to this server. The API uses local SQLite at `backend/arena.db` (override with `ARENA_DB_PATH`) or PostgreSQL when `DATABASE_URL` is configured. Vercel `/tmp` SQLite is ephemeral and unsuitable for durable shopper or associate state. See the [database deployment assessment](docs/deployment-database.md). To let the API call a local runner, set `LOCAL_RUNNER_URL=http://127.0.0.1:8765`; the current runner does not verify inference, so results remain `DEMO / NOT VERIFIED`.
 
 ## Run the local runner (optional)
 
@@ -45,4 +45,7 @@ Bundled comparison fixtures are labelled `SAMPLE DATA`; they are not measurement
 npm.cmd run build
 python -m pytest backend/tests -q
 node --test frontend/tests/session-persistence.test.mjs
+npm.cmd run build
 ```
+
+PostgreSQL support is implemented but has not been exercised against a live database in this workspace. No production database URL, Vercel project link, or deployment credentials were available during validation.

@@ -27,5 +27,7 @@ def test_median_and_npu_runtime_evidence():
     assert summarize([1, 9, 5]) == 5
     assert summarize([]) is None
     assert not valid_npu_evidence({"execution_provider":"NPU","runtime_verified":False})
-    assert valid_npu_evidence({"execution_provider":"NPU","runtime_verified":True,"model_hash":"abc","prompt_hash":"def"})
+    evidence={"execution_provider":"NPU","runtime_verified":True,"verification_status":"VERIFIED","signature_verified":True,"device_name":"Intel(R) AI Boost","runtime_version":"2026.0","model_hash":"a"*64,"input_hash":"b"*64,"prompt_hash":"c"*64}
+    assert valid_npu_evidence(evidence)
+    assert not valid_npu_evidence({**evidence,"signature_verified":False})
 
