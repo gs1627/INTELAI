@@ -1,0 +1,24 @@
+{
+  "evidence": "SAMPLE DATA",
+  "disclaimer": "Illustrative product/profile data for a prototype. Sample prices are INR. Not Intel-certified, validated store inventory, or a processor performance claim.",
+  "profiles": [
+    {"brand":"ASUS","model":"Vivobook S 14 OLED (demo profile)","processor":"Intel Core Ultra 5 228V","tier":5,"series":2,"ram":"16 GB LPDDR5X (illustrative)","gpu":"OEM configuration confirmation required","npu":"40 NPU TOPS on processor; verify OEM system","price_inr":74900},
+    {"brand":"ASUS","model":"Zenbook S 14 (demo profile)","processor":"Intel Core Ultra 7 258V","tier":7,"series":2,"ram":"32 GB LPDDR5X (illustrative)","gpu":"OEM configuration confirmation required","npu":"47 NPU TOPS on processor; verify OEM system","price_inr":109900},
+    {"brand":"ASUS","model":"ProArt P16 (demo profile)","processor":"Intel Core Ultra 9 285H","tier":9,"series":2,"ram":"32 GB DDR5 (illustrative)","gpu":"OEM configuration confirmation required","npu":"13 NPU TOPS on processor; verify OEM system","price_inr":159900},
+    {"brand":"Lenovo","model":"Yoga 7i 2-in-1 (demo profile)","processor":"Intel Core Ultra 5 228V","tier":5,"series":2,"ram":"16 GB LPDDR5X (illustrative)","gpu":"OEM configuration confirmation required","npu":"40 NPU TOPS on processor; verify OEM system","price_inr":69900},
+    {"brand":"Lenovo","model":"Yoga Pro 7i (demo profile)","processor":"Intel Core Ultra 7 258V","tier":7,"series":2,"ram":"32 GB LPDDR5X (illustrative)","gpu":"OEM configuration confirmation required","npu":"47 NPU TOPS on processor; verify OEM system","price_inr":119900},
+    {"brand":"Lenovo","model":"ThinkPad X1 Carbon (demo profile)","processor":"Intel Core Ultra 9 285H","tier":9,"series":2,"ram":"32 GB LPDDR5X (illustrative)","gpu":"OEM configuration confirmation required","npu":"13 NPU TOPS on processor; verify OEM system","price_inr":149900},
+    {"brand":"HP","model":"OmniBook Ultra Flip (demo profile)","processor":"Intel Core Ultra 5 228V","tier":5,"series":2,"ram":"16 GB LPDDR5X (illustrative)","gpu":"OEM configuration confirmation required","npu":"40 NPU TOPS on processor; verify OEM system","price_inr":84900},
+    {"brand":"HP","model":"OmniBook Ultra 14 (demo profile)","processor":"Intel Core Ultra 7 258V","tier":7,"series":2,"ram":"32 GB LPDDR5X (illustrative)","gpu":"OEM configuration confirmation required","npu":"47 NPU TOPS on processor; verify OEM system","price_inr":119900},
+    {"brand":"HP","model":"Spectre x360 16 (demo profile)","processor":"Intel Core Ultra 9 285H","tier":9,"series":2,"ram":"32 GB LPDDR5X (illustrative)","gpu":"OEM configuration confirmation required","npu":"13 NPU TOPS on processor; verify OEM system","price_inr":159900},
+    {"brand":"ASUS","model":"Vivobook Series 3 (demo profile)","processor":"Intel Core Ultra 5 322","tier":5,"series":3,"ram":"OEM confirmation required","gpu":"OEM confirmation required","npu":"OEM confirmation required","price_inr":89900},
+    {"brand":"ASUS","model":"Zenbook Series 3 (demo profile)","processor":"Intel Core Ultra 7 366H","tier":7,"series":3,"ram":"OEM confirmation required","gpu":"OEM confirmation required","npu":"OEM confirmation required","price_inr":129900},
+    {"brand":"ASUS","model":"Zenbook Series 3 16 (demo profile)","processor":"Intel Core Ultra 9 386H","tier":9,"series":3,"ram":"OEM confirmation required","gpu":"OEM confirmation required","npu":"OEM confirmation required","price_inr":179900},
+    {"brand":"Lenovo","model":"Yoga Series 3 (demo profile)","processor":"Intel Core Ultra 5 322","tier":5,"series":3,"ram":"OEM confirmation required","gpu":"OEM confirmation required","npu":"OEM confirmation required","price_inr":99900},
+    {"brand":"Lenovo","model":"Yoga Pro Series 3 (demo profile)","processor":"Intel Core Ultra 7 366H","tier":7,"series":3,"ram":"OEM confirmation required","gpu":"OEM confirmation required","npu":"OEM confirmation required","price_inr":139900},
+    {"brand":"Lenovo","model":"Yoga Pro Series 3 16 (demo profile)","processor":"Intel Core Ultra 9 386H","tier":9,"series":3,"ram":"OEM confirmation required","gpu":"OEM confirmation required","npu":"OEM confirmation required","price_inr":189900},
+    {"brand":"HP","model":"OmniBook Series 3 (demo profile)","processor":"Intel Core Ultra 5 322","tier":5,"series":3,"ram":"OEM confirmation required","gpu":"OEM confirmation required","npu":"OEM confirmation required","price_inr":99900},
+    {"brand":"HP","model":"OmniBook Series 3 14 (demo profile)","processor":"Intel Core Ultra 7 366H","tier":7,"series":3,"ram":"OEM confirmation required","gpu":"OEM confirmation required","npu":"OEM confirmation required","price_inr":139900},
+    {"brand":"HP","model":"OmniBook Series 3 16 (demo profile)","processor":"Intel Core Ultra 9 386H","tier":9,"series":3,"ram":"OEM confirmation required","gpu":"OEM confirmation required","npu":"OEM confirmation required","price_inr":189900}
+  ]
+}

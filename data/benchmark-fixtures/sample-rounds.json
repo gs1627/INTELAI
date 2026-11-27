@@ -1,0 +1,11 @@
+{
+  "evidence": "SAMPLE DATA",
+  "disclaimer": "All values below are invented for interface demonstration. They are not measured, validated, Intel-certified, or processor rankings. Do not use for purchasing conclusions.",
+  "benchmark_version": "arena-demo-0.1",
+  "records": [
+    {"brand":"ASUS","model":"Zenbook S 14","processor":"Intel Core Ultra 7 258V","tier":7,"series":3,"round_id":"cpu","metric":"completion_time_s","value":15.2,"sample_count":0},
+    {"brand":"ASUS","model":"ProArt P16 (demo profile)","processor":"Intel Core Ultra 9 285H","tier":9,"series":2,"round_id":"cpu","metric":"completion_time_s","value":13.8,"sample_count":0},
+    {"brand":"Lenovo","model":"Yoga Pro 7i","processor":"Intel Core Ultra 7 258V","tier":7,"series":3,"round_id":"cpu","metric":"completion_time_s","value":15.7,"sample_count":0},
+    {"brand":"HP","model":"OmniBook Ultra 14","processor":"Intel Core Ultra 7 258V","tier":7,"series":3,"round_id":"cpu","metric":"completion_time_s","value":15.4,"sample_count":0}
+  ]
+}
